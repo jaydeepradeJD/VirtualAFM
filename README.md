@@ -10,3 +10,9 @@ Virtual Atomic Force Microscope (AFM). Differentiable virtual AFM for generating
 ```bash
 # Create conda environment
 conda env create -f environment.yml
+```
+
+# TODOs
+- [ ] Update environment.yml/requirements.txt
+- [ ] Create a Hugging Face demo
+- [ ] Work to make the UI better
