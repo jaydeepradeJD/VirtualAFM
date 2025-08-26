@@ -13,7 +13,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 import time
-import psutil
+import argparse
+
 class MeshScaler:
     """Handle scaling between physical (nm) and normalized coordinates."""
     def __init__(self, verts_nm):
@@ -50,23 +51,40 @@ class VirtualAFM:
             device (torch.device): The device to use for computations.
         """
         self.device = device
+        self.scale = None
+        self.center = None
+        self.bbox_size = None
+        self.mesh_normalized = None
 
-    def load_mesh(self, mesh_path):
-        """
-        Load a mesh from the specified path and normalize its vertex coordinates.
-
-        Args:
-            mesh_path (str): Path to the mesh file.
-        """
-        mesh = load_objs_as_meshes([mesh_path], device=self.device)
-        verts = mesh.verts_packed()
-        verts_nm = verts * 0.1  # Convert verts from Angstrom to nanometers
-        mesh_scaler = MeshScaler(verts_nm)
-        verts_normalized = mesh_scaler.normalize_mesh(verts_nm)
-        self.scale = mesh_scaler.scale
-        self.center = mesh_scaler.center
-        self.bbox_size = mesh_scaler.bbox_size
-        self.mesh_normalized = Meshes(verts=[verts_normalized], faces=mesh.faces_list())
+    def load_mesh(self, mesh_path, angstrom_to_nm=False):
+        """Load a mesh with input validation."""
+        if not os.path.exists(mesh_path):
+            raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
+        
+        if not mesh_path.endswith('.obj'):
+            raise ValueError("Only .obj files are supported")
+        
+        try:
+            mesh = load_objs_as_meshes([mesh_path], device=self.device)
+            verts = mesh.verts_packed()
+            
+            if verts.numel() == 0:
+                raise ValueError("Mesh has no vertices")
+                
+            if angstrom_to_nm:
+                verts_nm = verts * 0.1  # Convert from Angstrom to nanometers
+            else:
+                verts_nm = verts
+            mesh_scaler = MeshScaler(verts_nm)
+            verts_normalized = mesh_scaler.normalize_mesh(verts_nm)
+            
+            self.scale = mesh_scaler.scale
+            self.center = mesh_scaler.center
+            self.bbox_size = mesh_scaler.bbox_size
+            self.mesh_normalized = Meshes(verts=[verts_normalized], faces=mesh.faces_list())
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load mesh: {str(e)}")
 
     def create_rasterizer(self, image_size=100, blur_radius=0.0, faces_per_pixel=1, bin_size=-1):
         """
@@ -361,12 +379,16 @@ class VirtualAFM:
         if selem is None:
             selem = self.spherical_selem(tip_radius_nm, nm_per_pixel)
         if isinstance(img, np.ndarray):
-            img = torch.from_numpy(img).cuda()
+            img = torch.from_numpy(img).to(self.device)
             img.requires_grad = True
         if isinstance(selem, np.ndarray):
-            selem = torch.from_numpy(selem).cuda()
+            selem = torch.from_numpy(selem).to(self.device)
             selem.requires_grad = True
-        # dilated = self.nonflat_grayscale_dilation2(img, selem, background_value)
+        
+        # Ensure both tensors are on the same device
+        if img.device != selem.device:
+            selem = selem.to(img.device)
+        
         dilated = self.differentiable_grayscale_dilation(img, selem, background_value)
         dilated = dilated.detach().cpu().numpy()
         return dilated
@@ -436,7 +458,7 @@ def process_single_view(virtual_afm, view_idx, rasterizer, save_dir, tip_radius_
     depth_map_tip_convolved = virtual_afm.perform_tip_convolution(
         depth_map_padded, 
         tip_radius_nm=tip_radius_nm, 
-        nm_per_pixel=1.0, 
+        nm_per_pixel=scan_step_nm, 
         background_value=0
     )
     
@@ -463,31 +485,55 @@ def process_single_view(virtual_afm, view_idx, rasterizer, save_dir, tip_radius_
     plt.imsave(f"{save_dir}/depth_map_with_tip_convolution_256_{view_idx}.png", 
                depth_map_256, cmap='afmhot')
 
-def main():
-    # Setup
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Initialize VirtualAFM
-    protein_name = sys.argv[1]
-    mesh_file_name = f"{protein_name.split('.')[0]}_surface.obj"
-    mesh_path = f"/work/mech-ai/jrrade/Protein/AF_swissprot_550k_data_old/{protein_name}/{mesh_file_name}"
-    save_dir = f"/work/mech-ai/jrrade/Protein/AF_swissprot_py3d_virtual_afm/{protein_name}"
-    # save_dir = f"./{protein_name}"
-    
-    # Create save directory and load mesh
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Initialize VirtualAFM and create rasterizer
-    virtual_afm = VirtualAFM(device)
-    virtual_afm.load_mesh(mesh_path)
-    max_image_size = 512
-    rasterizer = virtual_afm.create_rasterizer(max_image_size)
-    
-    # Process multiple views
-    num_views = 25
-    for view_idx in range(num_views):
-        process_single_view(virtual_afm, view_idx, rasterizer, save_dir)
+def main(args):
+    """Main function with improved error handling and progress tracking."""
+    try:
+        # Setup
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+        
+        # Validate inputs
+        if args.protein_name is None:
+            raise ValueError("Please provide a protein name")
+        
+        mesh_path = os.path.join(args.input_dir, f"{args.protein_name}_surface_blob.obj")
+        if not os.path.exists(mesh_path):
+            raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
+        
+        save_dir = os.path.join(args.save_dir, args.protein_name)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Initialize VirtualAFM
+        virtual_afm = VirtualAFM(device)
+        virtual_afm.load_mesh(mesh_path, angstrom_to_nm=args.angstrom_to_nm)
+        
+        rasterizer = virtual_afm.create_rasterizer(args.max_image_size)
+        
+        # Process multiple views with progress tracking
+        print(f"Processing {args.num_views} views...")
+        for view_idx in range(args.num_views):
+            print(f"Processing view {view_idx + 1}/{args.num_views}")
+            process_single_view(virtual_afm, view_idx, rasterizer, save_dir, 
+                              tip_radius_nm=args.tip_radius_nm, 
+                              scan_step_nm=args.scan_step_nm)
+        
+        print(f"Successfully processed {args.num_views} views. Results saved to {save_dir}")
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    args = argparse.ArgumentParser()
+    args.add_argument("--device", type=str, default="cuda:0")
+    args.add_argument("--input_dir", type=str, default="./example")
+    args.add_argument("--save_dir", type=str, default="./example")
+    args.add_argument("--protein_name", type=str, default=None)
+    args.add_argument("--num_views", type=int, default=25)
+    args.add_argument("--max_image_size", type=int, default=512)
+    args.add_argument("--angstrom_to_nm", type=bool, default=False)
+    args.add_argument("--tip_radius_nm", type=float, default=1.0)
+    args.add_argument("--scan_step_nm", type=float, default=1.0)
+    args = args.parse_args()
+
+    main(args)
