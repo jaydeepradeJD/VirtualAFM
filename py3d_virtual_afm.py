@@ -450,7 +450,7 @@ def process_single_view(virtual_afm, view_idx, rasterizer, save_dir, tip_radius_
     depth_map_array = depth_map.clone().cpu().numpy()
     depth_map_downsampled = cv2.resize(depth_map_array, (dsize, dsize), 
                                      interpolation=cv2.INTER_NEAREST_EXACT)
-    
+    print('dsize', dsize)
     # Add padding and perform tip convolution
     pad_size = 5
     depth_map_padded = np.pad(depth_map_downsampled, ((pad_size, pad_size), (pad_size, pad_size)), 
